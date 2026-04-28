@@ -904,8 +904,13 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         throw e
                     } catch (Exception e) {
                         // If the exception is about job being inactive, enrich it with log path
-                        if (e.message.contains("is no longer active")) {
-                            throw new Exception("${e.message}. Check SLURM logs at /home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out on ${cluster.host}")
+                        // and throw typed so downstream consumers route via instanceof rather
+                        // than substring matching on the catalog. The "<typed:..." marker keeps
+                        // the [INFRA-RETRY] log line distinguishable from catalog-matched fallbacks.
+                        if (e.message?.contains("is no longer active")) {
+                            throw new InfraFailure(
+                                "${e.message}. Check SLURM logs at /home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out on ${cluster.host}",
+                                e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-job-inactive>")
                         }
                         // Otherwise, log the error but continue (SSH might be temporarily unavailable)
                         pipeline.echo("Warning: Could not check SLURM job status: ${e.message}")
@@ -1691,31 +1696,23 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
       // User abort / pipeline timeout -- never retry
       throw e
     } catch (Exception e) {
-      // FlowInterruptedException may not extend InterruptedException in all Jenkins versions
-      if (e.toString().contains("FlowInterruptedException") ||
-          e.toString().contains("AbortException: script returned exit code 143")) {
-        throw e
-      }
+      // classify() handles FlowInterruptedException + exit-code-143 +
+      // typed throws + cause-chain pattern matching, returning one of
+      // PipelineInterruption / InfraFailure / UserFailure.
+      def c = classify(e, InfraFailure.SLURM)
+      if (c instanceof PipelineInterruption) throw e
+      if (!(c instanceof InfraFailure))      throw e   // UserFailure -> don't retry
 
-      // Check if this is a retryable infrastructure failure
-      def classification = classifyInfraFailure(e)
-
-      if (!classification.isInfraFailure) {
-        // Not an infrastructure failure (test failure, compilation error, etc.)
-        throw e
-      }
-
-      // Determine effective max retries for this pattern
-      def effectiveMax = classification.isSingleRetryOnly ? 1 : SLURM_INFRA_RETRY_MAX
+      def effectiveMax = (c.severity == InfraFailure.PERSISTENT) ? 1 : SLURM_INFRA_RETRY_MAX
 
       if (attempt > effectiveMax) {
-        echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${classification.matchedPattern}) " +
+        echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) " +
              "but max retries (${effectiveMax}) exhausted after ${attempt} attempts. Failing."
         throw e
       }
 
       echo "[INFRA-RETRY] ${stageName}: Infrastructure failure detected on attempt ${attempt}: " +
-           "${classification.matchedPattern}"
+           "${c.detectedPattern}"
       echo "[INFRA-RETRY] ${stageName}: Exception: ${e.toString()}"
       echo "[INFRA-RETRY] ${stageName}: Will retry (attempt ${attempt + 1} of ${effectiveMax + 1}) after 60s cooldown."
 
@@ -1922,10 +1919,10 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             // for forensics; only the in-build test reporting is gated.
             boolean suppressTestReporting = false
             if (!isFinalAttempt && stageIsFailed && caughtError != null) {
-                def cls = classifyInfraFailure(caughtError, K8S_INFRA_FAILURE_PATTERNS, K8S_INFRA_SINGLE_RETRY_PATTERNS)
-                suppressTestReporting = cls.isInfraFailure
-                if (suppressTestReporting) {
-                    echo "[INFRA-RETRY] ${stageName}${postTag}: suppressing synthetic stage-fail XML and junit() on intermediate retryable infra failure (${cls.matchedPattern})"
+                def c = classify(caughtError, InfraFailure.K8S)
+                if (c instanceof InfraFailure) {
+                    suppressTestReporting = true
+                    echo "[INFRA-RETRY] ${stageName}${postTag}: suppressing synthetic stage-fail XML and junit() on intermediate retryable infra failure (${c.detectedPattern})"
                 }
             }
 
@@ -3566,29 +3563,23 @@ def runKubernetesPodWithInfraRetry(pipeline, podSpec, containerName, String stag
             // User abort / pipeline timeout -- never retry
             throw e
         } catch (Exception e) {
-            // FlowInterruptedException may not extend InterruptedException in all Jenkins versions
-            if (e.toString().contains("FlowInterruptedException") ||
-                e.toString().contains("AbortException: script returned exit code 143")) {
-                throw e
-            }
+            // classify() handles FlowInterruptedException + exit-code-143 +
+            // typed throws + cause-chain pattern matching, returning one of
+            // PipelineInterruption / InfraFailure / UserFailure.
+            def c = classify(e, InfraFailure.K8S)
+            if (c instanceof PipelineInterruption) throw e
+            if (!(c instanceof InfraFailure))      throw e   // UserFailure -> don't retry
 
-            def classification = classifyInfraFailure(e, K8S_INFRA_FAILURE_PATTERNS, K8S_INFRA_SINGLE_RETRY_PATTERNS)
-
-            if (!classification.isInfraFailure) {
-                // Not an infrastructure failure (test failure, compilation error, etc.)
-                throw e
-            }
-
-            def effectiveMax = classification.isSingleRetryOnly ? 1 : K8S_INFRA_RETRY_MAX
+            def effectiveMax = (c.severity == InfraFailure.PERSISTENT) ? 1 : K8S_INFRA_RETRY_MAX
 
             if (attempt > effectiveMax) {
-                echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${classification.matchedPattern}) " +
+                echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) " +
                      "but max retries (${effectiveMax}) exhausted after ${attempt} attempts. Failing."
                 throw e
             }
 
             echo "[INFRA-RETRY] ${stageName}: Infrastructure failure detected on attempt ${attempt}: " +
-                 "${classification.matchedPattern}"
+                 "${c.detectedPattern}"
             echo "[INFRA-RETRY] ${stageName}: Exception: ${e.toString()}"
             echo "[INFRA-RETRY] ${stageName}: Will retry (attempt ${attempt + 1} of ${effectiveMax + 1}) after 60s cooldown."
 
