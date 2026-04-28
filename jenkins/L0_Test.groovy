@@ -165,6 +165,84 @@ K8S_INFRA_SINGLE_RETRY_PATTERNS = [
 // independently as production telemetry comes in.
 K8S_INFRA_RETRY_MAX = 2
 
+// ============================================================================
+// Typed-exception hierarchy for infra/test failure classification.
+//
+// `classify(ex, scope)` (defined below, near classifyInfraFailure) returns one
+// of these. Producers may also throw them directly; `classify` short-circuits
+// on instanceof and returns the typed exception unchanged.
+//
+// String constants (not Groovy enums) intentionally — Groovy enums declared at
+// pipeline-script top level have historically been tricky across CPS save/
+// restore boundaries when a build resumes from disk. A handful of
+// `static final String` is mechanically equivalent and resume-safe.
+// ============================================================================
+
+class TrtllmCiException extends RuntimeException {
+    TrtllmCiException(String msg)              { super(msg) }
+    TrtllmCiException(String msg, Throwable c) { super(msg, c) }
+}
+
+class InfraFailure extends TrtllmCiException {
+    static final String TRANSIENT  = "TRANSIENT"
+    static final String PERSISTENT = "PERSISTENT"   // single-retry-only
+    static final String SLURM      = "SLURM"
+    static final String K8S        = "K8S"
+    static final String BOTH       = "BOTH"
+
+    String severity         // TRANSIENT | PERSISTENT
+    String scope            // SLURM | K8S; never BOTH on a thrown instance
+    String detectedPattern  // "<typed:...>" for direct throws, matched substring for catalog fallback
+
+    InfraFailure(String msg, Throwable c, String sev, String sc, String pat) {
+        super(msg, c)
+        severity = sev
+        scope = sc
+        detectedPattern = pat
+    }
+}
+
+class UserFailure extends TrtllmCiException {
+    UserFailure(String msg, Throwable c) { super(msg, c) }
+}
+
+class PipelineInterruption extends TrtllmCiException {
+    PipelineInterruption(String msg, Throwable c) { super(msg, c) }
+}
+
+// Unified pattern catalog. Each row tags its pattern with a severity
+// (TRANSIENT vs single-retry PERSISTENT) and a scope (SLURM, K8S, or BOTH).
+// `classify(ex, scope)` filters by `row.scope in {scope, BOTH}` so a stray
+// SLURM-shaped string in a K8s exception (or vice-versa) doesn't cross-
+// contaminate. Origins of each entry are documented in the prior
+// SLURM_INFRA_FAILURE_PATTERNS / K8S_INFRA_FAILURE_PATTERNS comment blocks
+// above; preserved here as a single source of truth.
+PATTERN_CATALOG = [
+    // ---- BOTH (Jenkins remoting / durable-task / kubelet shared) ----
+    [pattern: "channel is closing down or has closed down",                severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
+    [pattern: "ChannelClosedException",                                    severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
+    [pattern: "ClosedChannelException",                                    severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
+    [pattern: "RequestAbortedException",                                   severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
+    [pattern: "Connection was broken",                                     severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
+    [pattern: "marked offline",                                            severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
+    [pattern: "process apparently never started",                          severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
+    [pattern: "wrapper script does not seem to be touching the log file",  severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
+    [pattern: "Reason: Evicted",                                           severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
+    [pattern: "Cannot contact ",                                           severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
+    // ---- SLURM-only ----
+    [pattern: "No route to host",                                          severity: InfraFailure.TRANSIENT,  scope: InfraFailure.SLURM],
+    [pattern: "Permission denied, please try again",                       severity: InfraFailure.PERSISTENT, scope: InfraFailure.SLURM],
+    [pattern: "DUE TO TIME LIMIT",                                         severity: InfraFailure.PERSISTENT, scope: InfraFailure.SLURM],
+    [pattern: "CANCELLED",                                                 severity: InfraFailure.PERSISTENT, scope: InfraFailure.SLURM],
+    // ---- K8s-only ----
+    [pattern: "ImagePullBackOff",                                          severity: InfraFailure.TRANSIENT,  scope: InfraFailure.K8S],
+    [pattern: "ErrImagePull",                                              severity: InfraFailure.TRANSIENT,  scope: InfraFailure.K8S],
+    [pattern: "OCI runtime exec failed",                                   severity: InfraFailure.TRANSIENT,  scope: InfraFailure.K8S],
+    [pattern: "node status is not ready",                                  severity: InfraFailure.TRANSIENT,  scope: InfraFailure.K8S],
+    [pattern: "OOMKilled",                                                 severity: InfraFailure.PERSISTENT, scope: InfraFailure.K8S],
+    [pattern: "Connection failed",                                         severity: InfraFailure.PERSISTENT, scope: InfraFailure.K8S],
+]
+
 // ENABLE_NGC_DEVEL_IMAGE_TEST is currently disabled in the Jenkins BuildDockerImageSanityTest job config
 ENABLE_NGC_DEVEL_IMAGE_TEST = params.enableNgcDevelImageTest ?: false
 ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
@@ -224,6 +302,86 @@ def classifyInfraFailure(Exception ex, List extraInfraPatterns=[], List extraSin
     }
 
     return result
+}
+
+/**
+ * Typed-exception classifier. Returns one of:
+ *   - PipelineInterruption  (user abort / SIGTERM / FlowInterruptedException)
+ *   - InfraFailure          (transient or persistent retryable infra failure)
+ *   - UserFailure           (default; tests/build genuinely failed, do not retry)
+ *
+ * Producers may throw any TrtllmCiException directly; classify() short-circuits
+ * on instanceof and returns the typed exception unchanged. For exceptions
+ * originating in third-party code (Jenkins remoting, durable-task plugin,
+ * kubelet, etc.) we walk the .cause + .getSuppressed() chain into a single
+ * lowercase blob and match against PATTERN_CATALOG filtered by the caller's
+ * `scope` (InfraFailure.SLURM | InfraFailure.K8S).
+ *
+ * Will replace classifyInfraFailure(...) entirely once consumers migrate; for
+ * now the two coexist (this commit is additive — no call-site changes).
+ */
+def classify(Throwable ex, String scope) {
+    // 1. Already typed (producer throw or earlier classify call) — pass through.
+    if (ex instanceof TrtllmCiException) {
+        return ex
+    }
+
+    // 2. Interrupt markers — never retry. Walk the cause chain to find
+    //    FlowInterruptedException regardless of where it sits in the chain.
+    if (ex instanceof InterruptedException) {
+        return new PipelineInterruption(ex.message ?: "interrupted", ex)
+    }
+    def cur = ex
+    while (cur != null) {
+        if (cur.getClass().name.contains("FlowInterruptedException")) {
+            return new PipelineInterruption(ex.message ?: "FlowInterrupted", ex)
+        }
+        cur = cur.cause
+    }
+    if (ex instanceof hudson.AbortException && ex.message?.contains("script returned exit code 143")) {
+        return new PipelineInterruption(ex.message, ex)
+    }
+
+    // 3. Cycle-safe walk over .cause AND .getSuppressed(). System.identityHashCode
+    //    + a HashSet acts as the IdentityHashMap visited-set — avoids infinite
+    //    loops on self-referential causes (rare but free to defend against).
+    def visited = new HashSet()
+    def stack = [ex]
+    def parts = []
+    while (!stack.isEmpty()) {
+        def t = stack.remove(stack.size() - 1)
+        if (t == null) continue
+        def id = System.identityHashCode(t)
+        if (visited.contains(id)) continue
+        visited.add(id)
+        parts.add(t.toString())
+        if (t.cause != null) stack.add(t.cause)
+        def suppressed = null
+        try {
+            suppressed = t.getSuppressed()
+        } catch (Throwable ignore) {
+            // Some Throwable subclasses override getSuppressed() to throw; ignore.
+        }
+        if (suppressed != null) {
+            for (s in suppressed) {
+                if (s != null) stack.add(s)
+            }
+        }
+    }
+    def lowerBlob = parts.join(" ").toLowerCase()
+
+    // 4. Pattern catalog match, scope-filtered (BOTH always applies).
+    for (row in PATTERN_CATALOG) {
+        if (row.scope != scope && row.scope != InfraFailure.BOTH) {
+            continue
+        }
+        if (lowerBlob.contains(row.pattern.toLowerCase())) {
+            return new InfraFailure(ex.message ?: row.pattern, ex, row.severity, scope, row.pattern)
+        }
+    }
+
+    // 5. Default: not infra — caller should rethrow without retry.
+    return new UserFailure(ex.message ?: "no message", ex)
 }
 
 def scpFromRemoteCmd(Map remote, String remotePath, String localPath) {
