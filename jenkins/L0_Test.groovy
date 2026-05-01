@@ -164,8 +164,7 @@ class PipelineInterruption extends TrtllmCiException {
 // — so a stray SLURM-shaped string in a K8s exception (or vice-versa) cannot
 // cross-contaminate.
 PATTERN_CATALOG = [
-    // ---- Jenkins remoting / durable-task / kubelet ----
-    // (legacy SLURM list -> matched both consumers -> scope BOTH)
+    // ---- Jenkins remoting / durable-task / kubelet (apply to both paths) ----
     [pattern: "channel is closing down or has closed down",                severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
     [pattern: "ChannelClosedException",                                    severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
     [pattern: "ClosedChannelException",                                    severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
@@ -183,13 +182,17 @@ PATTERN_CATALOG = [
     [pattern: "No route to host",                                          severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
     [pattern: "Permission denied, please try again",                       severity: InfraFailure.PERSISTENT, scope: InfraFailure.BOTH],
     [pattern: "DUE TO TIME LIMIT",                                         severity: InfraFailure.PERSISTENT, scope: InfraFailure.BOTH],
-    // ---- K8s-only (legacy K8S list -> matched only K8s consumer -> scope K8S) ----
+    // ---- SLURM-only ----
+    // CANCELLED activated -- previously dead in legacy single-retry list.
+    [pattern: "CANCELLED",                                                 severity: InfraFailure.PERSISTENT, scope: InfraFailure.SLURM],
+    // ---- JNLP agent disconnect (applies to both paths once K8s started using SLURM via K8s pods) ----
+    [pattern: "Cannot contact ",                                           severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
+    // ---- K8s-only ----
     [pattern: "ImagePullBackOff",                                          severity: InfraFailure.TRANSIENT,  scope: InfraFailure.K8S],
     [pattern: "ErrImagePull",                                              severity: InfraFailure.TRANSIENT,  scope: InfraFailure.K8S],
     [pattern: "OCI runtime exec failed",                                   severity: InfraFailure.TRANSIENT,  scope: InfraFailure.K8S],
     [pattern: "node status is not ready",                                  severity: InfraFailure.TRANSIENT,  scope: InfraFailure.K8S],
     [pattern: "OOMKilled",                                                 severity: InfraFailure.PERSISTENT, scope: InfraFailure.K8S],
-    [pattern: "Cannot contact ",                                           severity: InfraFailure.TRANSIENT,  scope: InfraFailure.K8S],
     [pattern: "Connection failed",                                         severity: InfraFailure.PERSISTENT, scope: InfraFailure.K8S],
 ]
 
